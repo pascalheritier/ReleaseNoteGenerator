@@ -16,7 +16,8 @@ namespace ReleaseNoteGenerator
     {
         #region Consts
 
-        public const string GitRepositoryExtension = ".git";
+        private const string GitRepositoryExtension = ".git";
+        private const string RemoteBranchPrefix = "origin/";
 
         #endregion
 
@@ -187,17 +188,27 @@ namespace ReleaseNoteGenerator
                         FailOnConflict = true,
                     }
                 };
-                Branch? targetBranch = repository.Branches.FirstOrDefault(b => b.FriendlyName == branchName);
-                if (targetBranch is null)
-                    throw new NullReferenceException($"Could not find branch {branchName} in repo {gitRepoName}.");
+                Branch? localBranch = repository.Branches.FirstOrDefault(b => b.FriendlyName == branchName);
+                Branch? trackedRemoteBranch = repository.Branches.FirstOrDefault(b => b.FriendlyName == RemoteBranchPrefix + branchName);
+                if (trackedRemoteBranch is null || !trackedRemoteBranch.IsRemote)
+                    throw new NotFoundException($"Could not find remote branch '{branchName}' in repository {gitRepoName}.");
 
-                Console.WriteLine($"Checking out branch {branchName} in existing repository {gitRepoName}...");
-                Commands.Checkout(repository, targetBranch);
-                Console.WriteLine($"Branch {branchName} checked out in existing repository {gitRepoName}.");
+                if (localBranch is null || !localBranch.IsCurrentRepositoryHead)
+                {
+                    Console.WriteLine($"Checking out branch '{branchName}' in repository {gitRepoName}...");
+                    if (localBranch is null)
+                        localBranch = repository.CreateBranch(branchName, trackedRemoteBranch.Tip);
 
-                Console.WriteLine($"Pulling latest commits for branch {branchName} in existing repository {gitRepoName}...");
+                    Branch branch = Commands.Checkout(repository, localBranch);
+                    Console.WriteLine($"Branch '{branchName}' checked out in repository {gitRepoName}.");
+                }
+
+                if (!localBranch.IsTracking)
+                    repository.Branches.Update(localBranch, b => b.TrackedBranch = trackedRemoteBranch.CanonicalName);
+
+                Console.WriteLine($"Pulling latest commits for branch '{branchName}' in repository {gitRepoName}...");
                 Commands.Pull(repository, signature, pullOptions);
-                Console.WriteLine($"Latest commits for branch {branchName} pulled in existing repository {gitRepoName}.");
+                Console.WriteLine($"Latest commits for branch '{branchName}' pulled in repository {gitRepoName}.");
             }
             else
             {
@@ -211,7 +222,7 @@ namespace ReleaseNoteGenerator
                 Console.WriteLine($"Cloning repository {gitRepoName}...");
                 Repository.Clone(repoUrl, repoCloneTmpPath, cloneOptions);
                 repository = new Repository(repoCloneTmpPath);
-                Console.WriteLine($"Clone of repository {gitRepoName} done, checked out branch: {branchName}.");
+                Console.WriteLine($"Clone of repository {gitRepoName} done, checked out branch '{branchName}'.");
 
             }
             return repository;
