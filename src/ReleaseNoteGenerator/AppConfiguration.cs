@@ -19,13 +19,13 @@
         public string Username { get; set; } = null!;
         public string RepositoryUrlPrefix { get; set; } = null!;
         public string RepoCloneTmpDirectory { get; set; } = null!;
-        public string BranchName { get; set; } = null!;
         public List<GitRepository> GitRepositories { get; set; } = null!;
     }
 
     internal class GitRepository
     {
         public string Name { get; set; } = null!;
+        public string BranchName { get; set; } = null!;
         public string CommitStartSha { get; set; } = null!;
         public string ReleaseNoteVersion { get; set; } = null!;
     }

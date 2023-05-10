@@ -1,6 +1,7 @@
 ﻿using LibGit2Sharp;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json.Linq;
+using NLog.Extensions.Logging;
 using Redmine.Net.Api;
 using Redmine.Net.Api.Types;
 using System.Collections.Specialized;
@@ -22,7 +23,6 @@ namespace ReleaseNoteGenerator
         #region Members
 
         private ILogger _logger;
-        private string _branchName;
         private string _repoCloneTmpDirectory;
         private string _username;
         private string _password;
@@ -37,7 +37,6 @@ namespace ReleaseNoteGenerator
         {
             _appConfiguration = appConfiguration;
             _logger = loggerFactory.CreateLogger<Generator>();
-            _branchName = appConfiguration.GitConfiguration.BranchName;
             _repoCloneTmpDirectory = appConfiguration.GitConfiguration.RepoCloneTmpDirectory;
             _username = appConfiguration.GitConfiguration.Username;
             _manager = new RedmineManager(appConfiguration.RedmineConfiguration.ServerUrl, appConfiguration.RedmineConfiguration.ApiKey);
@@ -52,38 +51,56 @@ namespace ReleaseNoteGenerator
             try
             {
                 // Get credentials
-                Console.WriteLine($"{Environment.NewLine}--------------------------------");
+                Console.WriteLine($"--------------------------------");
                 Console.WriteLine("Please enter your credentials:");
                 Console.WriteLine($"Username: {_username}");
                 Console.WriteLine("Password:");
                 _password = GetPassword();
+                Console.WriteLine(Environment.NewLine);
+                Console.WriteLine($"--------------------------------");
                 var credentials = new UsernamePasswordCredentials
                 {
                     Username = _username,
                     Password = _password
                 };
 
+                // pull or clone git repository
+                foreach (GitRepository gitRepository in _appConfiguration.GitConfiguration.GitRepositories)
+                {
+                    Console.WriteLine(Environment.NewLine);
+                    Console.WriteLine($"--------------------------------");
+                    Repository repository = CloneOrPullRepository(
+                        gitRepository.Name, 
+                        gitRepository.BranchName, 
+                        GetRepositoryGitTempPath(gitRepository.Name),
+                        GetRepositoryUrl(gitRepository.Name), 
+                        credentials);
+                    _gitRepositoryDictionary.Add(gitRepository.Name, repository);
+                    Console.WriteLine($"--------------------------------");
+                }
+
                 // get release note data
                 foreach (GitRepository gitRepository in _appConfiguration.GitConfiguration.GitRepositories)
                 {
-                    // Fetch or clone git repository
-                    string gitRepoName = gitRepository.Name;
-                    string repoUrl = _appConfiguration.GitConfiguration.RepositoryUrlPrefix + gitRepoName + GitRepositoryExtension;
-                    string repoCloneTmpPath = Path.Combine(_repoCloneTmpDirectory, gitRepoName);
-                    Repository repo = CloneOrFetchRepository(gitRepoName, repoCloneTmpPath, repoUrl, credentials);
-                    Console.WriteLine($"{Environment.NewLine}--------------------------------");
+                    Console.WriteLine(Environment.NewLine);
+                    Console.WriteLine($"--------------------------------");
+                    Console.WriteLine($"Start retrieving release note data for git repo {gitRepository.Name} in branch {gitRepository.BranchName}:");
+                    Console.WriteLine(Environment.NewLine);
 
-                    if (!_issueDictionary.ContainsKey(gitRepoName))
-                        _issueDictionary.Add(gitRepoName, new List<Issue>());
+                    if (!_gitRepositoryDictionary.ContainsKey(gitRepository.Name))
+                        throw new NotFoundException("");
+                    Repository repository = _gitRepositoryDictionary[gitRepository.Name];
+
+                    if (!_issueDictionary.ContainsKey(gitRepository.Name))
+                        _issueDictionary.Add(gitRepository.Name, new List<Issue>());
 
                     // Get merge commits and generate release note
-                    using (repo)
+                    using (repository)
                     {
-                        var branch = repo.Branches.FirstOrDefault(_B => _B.FriendlyName.Contains(_branchName));
-
+                        var branch = repository.Branches.FirstOrDefault(_B => _B.FriendlyName.Contains(gitRepository.BranchName));
                         if (branch == null)
                         {
-                            Console.WriteLine($"Branch {_branchName} not found in repository {repoUrl}.");
+                            Console.WriteLine($"Branch {gitRepository.BranchName} not found in repository {GetRepositoryUrl(gitRepository.Name)}.");
                             return;
                         }
 
@@ -93,15 +110,15 @@ namespace ReleaseNoteGenerator
                             IncludeReachableFrom = branch
                         };
 
-                        IEnumerable<Commit> commits = repo.Commits
+                        IEnumerable<Commit> commits = repository.Commits
                             .QueryBy(filter)
                             .Where(c => c.Parents.Count() > 1
-                            && c.Message.Contains($"into '{_branchName}'"));
+                            && c.Message.Contains($"into '{gitRepository.BranchName}'"));
 
-                        Commit? startCommit = repo.Commits.FirstOrDefault(_C => _C.Sha == gitRepository.CommitStartSha);
+                        Commit? startCommit = repository.Commits.FirstOrDefault(_C => _C.Sha == gitRepository.CommitStartSha);
                         if (startCommit == null)
                         {
-                            _logger.LogError($"Could not find start commit with SHA {gitRepository.CommitStartSha} in repository {gitRepoName}, which will be skipped during generation.");
+                            _logger.LogError($"Could not find start commit with SHA {gitRepository.CommitStartSha} in repository {gitRepository.Name}, which will be skipped during generation.");
                             continue;
                         }
 
@@ -114,17 +131,21 @@ namespace ReleaseNoteGenerator
                                 continue;
                             }
 
-                            if (!_issueDictionary[gitRepoName].Any(_I => _I.Id.ToString() == redmineIssueId))
+                            if (!_issueDictionary[gitRepository.Name].Any(_I => _I.Id.ToString() == redmineIssueId))
                             {
                                 if (!this.TryGetIssueFromOpenIssues(redmineIssueId, out Issue? foundIssue) || foundIssue is null)
                                     if (!this.TryGetIssueFromClosedIssues(redmineIssueId, out foundIssue) || foundIssue is null)
                                         throw new NotFoundException($"Could not find Redmine issue #{redmineIssueId}");
 
-                                _issueDictionary[gitRepoName].Add(foundIssue);
+                                _issueDictionary[gitRepository.Name].Add(foundIssue);
                                 Console.WriteLine($"- {commit.Author.When}| {this.IssueToReleaseNote(foundIssue)}");
                             }
                         }
                     }
+
+                    Console.WriteLine(Environment.NewLine);
+                    Console.WriteLine($"End of retrieving release note data for git repo {gitRepository.Name} in branch {gitRepository.BranchName}:");
+                    Console.WriteLine($"--------------------------------");
                 }
 
                 // generate release note file
@@ -138,22 +159,45 @@ namespace ReleaseNoteGenerator
 
         #region Git helpers
 
-        private Repository CloneOrFetchRepository(string gitRepoName, string repoCloneTmpPath, string repoUrl, UsernamePasswordCredentials credentials)
+        private Dictionary<string, Repository> _gitRepositoryDictionary = new();
+
+        private Repository CloneOrPullRepository(
+            string gitRepoName,
+            string branchName,
+            string repoCloneTmpPath,
+            string repoUrl,
+            UsernamePasswordCredentials credentials)
         {
             Repository repository;
             if (Directory.Exists(repoCloneTmpPath))
             {
-                // fetch
+                // pull
                 repository = new Repository(repoCloneTmpPath);
-                FetchOptions options = new()
+                Signature signature = new(new Identity(credentials.Username, $"{credentials.Username}@site.com"), DateTimeOffset.Now);
+                PullOptions pullOptions = new PullOptions
                 {
-                    Prune = true,
-                    TagFetchMode = TagFetchMode.Auto,
-                    CredentialsProvider = (_url, _user, _cred) => credentials
+                    FetchOptions = new FetchOptions
+                    {
+                        Prune = true,
+                        TagFetchMode = TagFetchMode.Auto,
+                        CredentialsProvider = (_url, _user, _cred) => credentials
+                    },
+                    MergeOptions = new MergeOptions
+                    {
+                        FailOnConflict = true,
+                    }
                 };
-                var remote = repository.Network.Remotes["origin"];
-                var refSpecs = remote.FetchRefSpecs.Select(x => x.Specification);
-                Commands.Fetch(repository, remote.Name, refSpecs, options, "Fetching remote");
+                Branch? targetBranch = repository.Branches.FirstOrDefault(b => b.FriendlyName == branchName);
+                if (targetBranch is null)
+                    throw new NullReferenceException($"Could not find branch {branchName} in repo {gitRepoName}.");
+
+                Console.WriteLine($"Checking out branch {branchName} in existing repository {gitRepoName}...");
+                Commands.Checkout(repository, targetBranch);
+                Console.WriteLine($"Branch {branchName} checked out in existing repository {gitRepoName}.");
+
+                Console.WriteLine($"Pulling latest commits for branch {branchName} in existing repository {gitRepoName}...");
+                Commands.Pull(repository, signature, pullOptions);
+                Console.WriteLine($"Latest commits for branch {branchName} pulled in existing repository {gitRepoName}.");
             }
             else
             {
@@ -162,32 +206,15 @@ namespace ReleaseNoteGenerator
                 CloneOptions cloneOptions = new()
                 {
                     CredentialsProvider = (_url, _user, _cred) => credentials,
-                    BranchName = _branchName
+                    BranchName = branchName
                 };
                 Console.WriteLine($"Cloning repository {gitRepoName}...");
                 Repository.Clone(repoUrl, repoCloneTmpPath, cloneOptions);
                 repository = new Repository(repoCloneTmpPath);
-                Console.WriteLine($"Clone of repository {gitRepoName} done.");
+                Console.WriteLine($"Clone of repository {gitRepoName} done, checked out branch: {branchName}.");
 
             }
             return repository;
-        }
-
-        private bool TryGetRedmineIssueNumber(string commitMessage, out string redmineIssueId, out string mergeMessage)
-        {
-            redmineIssueId = string.Empty;
-            mergeMessage = string.Empty;
-            Regex regex = new("#([0-9]+)");
-            Match match = regex.Match(commitMessage);
-            if (match.Success)
-            {
-                if (match.Groups.Count > 1)
-                {
-                    redmineIssueId = match.Groups.Values.ElementAt(1)?.Value;
-                    return true;
-                }
-            }
-            return false;
         }
 
         private string GetPassword()
@@ -213,9 +240,36 @@ namespace ReleaseNoteGenerator
             return password;
         }
 
+        private string GetRepositoryUrl(string gitRepoName)
+        {
+            return _appConfiguration.GitConfiguration.RepositoryUrlPrefix + gitRepoName + GitRepositoryExtension;
+        }
+
+        private string GetRepositoryGitTempPath(string gitRepoName)
+        {
+            return Path.Combine(_repoCloneTmpDirectory, gitRepoName);
+        }
+
         #endregion
 
         #region Redmine helpers
+
+        private bool TryGetRedmineIssueNumber(string commitMessage, out string redmineIssueId, out string mergeMessage)
+        {
+            redmineIssueId = string.Empty;
+            mergeMessage = string.Empty;
+            Regex regex = new("#([0-9]+)");
+            Match match = regex.Match(commitMessage);
+            if (match.Success)
+            {
+                if (match.Groups.Count > 1)
+                {
+                    redmineIssueId = match.Groups.Values.ElementAt(1)?.Value;
+                    return true;
+                }
+            }
+            return false;
+        }
 
         private bool TryGetIssueFromOpenIssues(string targetIssueId, out Issue? foundIssue)
         {
