@@ -17,6 +17,7 @@
     internal class GitConfiguration
     {
         public string Username { get; set; } = null!;
+        public string PAT { get; set; } = null!;
         public string RepositoryUrlPrefix { get; set; } = null!;
         public string RepoCloneTmpDirectory { get; set; } = null!;
         public List<GitRepository> GitRepositories { get; set; } = null!;
